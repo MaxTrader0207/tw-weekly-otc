@@ -27,11 +27,11 @@ async function getJ(url) {
   let last;
   for (let i = 0; i < 3; i++) {
     try {
-      const r = await fetch(url, {headers: {'User-Agent': UA, 'Accept': 'application/json,text/plain,*/*', 'Referer': 'https://www.tpex.org.tw/'}, redirect: 'manual'});
+      const r = await fetch(url, {headers: {'User-Agent': UA, 'Accept': 'application/json,text/plain,*/*', 'Referer': 'https://www.tpex.org.tw/'}, redirect: 'manual', signal: AbortSignal.timeout(30000)});
       if (r.status >= 300 && r.status < 400) throw new Error(`HTTP ${r.status} 轉址到 ${r.headers.get('location')}（可能被擋）`);
       if (!r.ok) throw new Error('HTTP ' + r.status);
       return await r.json();
-    } catch (e) { last = e; await sleep(3000 * (i + 1)); }
+    } catch (e) { last = e; console.log(`  第 ${i + 1} 次失敗：${e.message}`); await sleep(3000 * (i + 1)); }
   }
   throw last;
 }
@@ -95,6 +95,7 @@ async function main() {
       const q = c && c.q ? c.q : await fetchQuotes(d); await sleep(1500);
       if (!q) { if (k >= 2) fs.writeFileSync(f, JSON.stringify({closed: true})); continue; }   // 兩天前仍查無資料＝休市
       const i = await fetchInsti(d); await sleep(1500); fetched++;
+      console.log(`${slash(d)}：行情 ${Object.keys(q).length} 檔、三大法人 ${i ? Object.keys(i).length + ' 檔' : '尚未公布'}`);
       c = {date: slash(d), q, i: i || null};
       fs.writeFileSync(f, JSON.stringify(c));
     }
