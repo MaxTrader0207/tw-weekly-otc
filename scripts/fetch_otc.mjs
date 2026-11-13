@@ -2,6 +2,8 @@
 // 來源：證券櫃檯買賣中心（櫃買中心）公開資料
 //   - 上櫃股票每日收盤行情：/www/zh-tw/afterTrading/dailyQuotes
 //   - 三大法人買賣明細：/www/zh-tw/insti/dailyTrade
+//   - 產業分類：上櫃公司基本資料 /openapi/v1/mopsfin_t187ap03_O 的產業別代碼，
+//     代碼名稱取自櫃買中心「三大法人買賣明細」頁面的產業別選單（每天更新一次，失敗沿用上次）
 // 產出：data/otc_week.json（台股週報 Worker 每天 19:00、22:00 讀取這一個檔案）
 // 原則：查不到就不寫，格式不符就讓整次執行失敗，不產生錯誤數字。
 import fs from 'node:fs';
@@ -78,6 +80,30 @@ async function fetchInsti(d) {
   return Object.keys(o).length > 50 ? o : null;
 }
 
+// 櫃買中心產業名稱 → 與證交所上市產業名稱一致，才能和上市合併計算產業資金
+const IND_ALIAS = {'金融業': '金融保險', '生技醫療': '生技醫療業', '油電燃氣': '油電燃氣業', '電腦及週邊業': '電腦及週邊設備業', '農業科技': '農業科技業'};
+async function getText(url) {
+  const r = await fetch(url, {headers: {'User-Agent': UA, 'Referer': 'https://www.tpex.org.tw/'}, redirect: 'manual', signal: AbortSignal.timeout(30000)});
+  if (r.status >= 300 && r.status < 400) throw new Error(`HTTP ${r.status} 轉址（可能被擋）`);
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  return r.text();
+}
+// 產業分類 → {代號: 產業名稱}
+async function fetchIndustry() {
+  const html = await getText('https://www.tpex.org.tw/zh-tw/mainboard/trading/major-institutional/detail/day.html');
+  const i = html.indexOf('>食品工業<'); if (i < 0) throw new Error('產業別選單找不到');
+  const seg = html.slice(html.lastIndexOf('<select', i), html.indexOf('</select>', i));
+  const names = {}; for (const m of seg.matchAll(/value="(\d{2})"[^>]*>\s*([^<]+?)\s*</g)) names[m[1]] = IND_ALIAS[m[2]] || m[2];
+  if (Object.keys(names).length < 25 || names['24'] !== '半導體業') throw new Error('產業別選單格式不符：' + JSON.stringify(names).slice(0, 200));
+  const list = await getJ('https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O');
+  if (!Array.isArray(list) || list.length < 500 || !('SecuritiesIndustryCode' in list[0]) || !('SecuritiesCompanyCode' in list[0])) throw new Error('上櫃公司基本資料格式不符');
+  const out = {}; let unknown = 0;
+  for (const x of list) { const c = String(x.SecuritiesCompanyCode).trim(), k = String(x.SecuritiesIndustryCode).trim().padStart(2, '0'); if (!isStock(c)) continue; if (names[k]) out[c] = names[k]; else unknown++; }
+  if (Object.keys(out).length < 500) throw new Error('產業分類筆數過少：' + Object.keys(out).length);
+  console.log(`產業分類：${Object.keys(out).length} 檔、${Object.keys(names).length} 類` + (unknown ? `（${unknown} 檔代碼不在選單中，不分類）` : ''));
+  return out;
+}
+
 const readJ = f => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch (e) { return null; } };
 
 async function main() {
@@ -111,11 +137,19 @@ async function main() {
   const kd = tradeDays.filter(x => x.d <= L).slice(0, KLINE_DAYS).reverse();
 
   const lastQ = week[week.length - 1].c.q, codes = Object.keys(lastQ);
+  // 產業分類：每天抓一次（存 cache/industry.json）；抓不到就沿用上次，仍沒有就不輸出（儀表板會標「上櫃」、不計入產業資金）
+  const indF = path.join(CACHE, 'industry.json'); let indC = readJ(indF);
+  if (!indC || indC.date !== slash(today)) {
+    try { indC = {date: slash(today), ind: await fetchIndustry()}; fs.writeFileSync(indF, JSON.stringify(indC)); }
+    catch (e) { console.log('產業分類抓取失敗，沿用上次：' + e.message); }
+  }
+  const ind = indC && indC.ind ? Object.fromEntries(codes.filter(c => indC.ind[c]).map(c => [c, indC.ind[c]])) : null;
   const out = {
-    v: 1, source: '證券櫃檯買賣中心（上櫃股票每日收盤行情、三大法人買賣明細）',
+    v: 1, source: '證券櫃檯買賣中心（上櫃股票每日收盤行情、三大法人買賣明細、上櫃公司基本資料產業別）',
     generatedAt: twNow().toISOString().replace('T', ' ').slice(0, 16) + '（台灣時間）',
     base: slash(baseDay.d), days: week.map(x => slash(x.d)),
     names: Object.fromEntries(codes.map(c => [c, lastQ[c][0]])),
+    ind, indDate: indC && indC.ind ? indC.date : null,
     issued: Object.fromEntries(codes.filter(c => lastQ[c][9]).map(c => [c, lastQ[c][9]])),
     // 每日行情：[收盤, 漲跌, 均價, 成交金額]（基準日＋本週各交易日）
     q: Object.fromEntries([baseDay, ...week].map(x => [slash(x.d), Object.fromEntries(Object.entries(x.c.q).map(([c, v]) => [c, [v[1], v[2], v[6], v[8]]]))])),
@@ -127,7 +161,7 @@ async function main() {
   fs.writeFileSync(path.join(OUT, 'otc_week.json'), JSON.stringify(out));
   // 清掉太舊的快取
   for (const f of fs.readdirSync(CACHE)) { const m = f.match(/^(\d{4})(\d{2})(\d{2})\.json$/); if (m && Date.UTC(+m[1], +m[2] - 1, +m[3]) < addD(today, -KEEP_CACHE_DAYS).getTime()) fs.unlinkSync(path.join(CACHE, f)); }
-  console.log(`完成：本週 ${out.days.join('、')}（基準日 ${out.base}），${codes.length} 檔；K 線 ${kd.length} 日；本次新抓 ${fetched} 日`);
+  console.log(`完成：本週 ${out.days.join('、')}（基準日 ${out.base}），${codes.length} 檔（產業分類 ${ind ? Object.keys(ind).length : 0} 檔）；K 線 ${kd.length} 日；本次新抓 ${fetched} 日`);
 }
 
 main().catch(e => { console.error('失敗：' + e.message); process.exit(1); });
